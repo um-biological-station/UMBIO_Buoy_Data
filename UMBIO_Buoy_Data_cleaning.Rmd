@@ -1,0 +1,217 @@
+---
+title: "R Notebook - UMBIO Buoy data cleaning"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(dplyr)
+```
+
+```{r}
+#read in newest data and existing export
+
+UMBIO_buoy_2023to2025 <- read_csv("~/UMBIO_Buoy_Data/raw_data/obs_63_545e_2f28_2f7a.csv",col_names = UMBIO_buoy_columnNames_new, skip = 2)
+
+UMBIO_buoy_2023to2025
+
+UMBIO_buoy_old <- read_csv("~/UMBIO_Buoy_Data/raw_data/obs_63_66df_97c6_6ec3.csv",col_names = UMBIO_buoy_columnNames_new, skip = 2)
+
+UMBIO_buoy_old
+```
+```{r}
+#grab all the column names
+UMBIO_buoy_columnNames_old <- names(UMBIO_buoy_old)
+
+UMBIO_buoy_columnNames_old
+
+UMBIO_buoy_columnNames_new <- names(UMBIO_buoy_2023to2025)
+
+UMBIO_buoy_columnNames_new
+```
+```{r}
+# Identify common observations and remove them from the second dataset
+# Assuming the datasets have a common timestamp id (e.g., "time")
+common_observations <- semi_join(UMBIO_buoy_2023to2025, UMBIO_buoy_old, by = "time")
+
+# Remove these common observations from UMBIO_buoy_2023to2025
+UMBIO_buoy_2023to2025_unique <- anti_join(UMBIO_buoy_2023to2025,common_observations, by = "time")
+
+# Bind the two datasets; UMBIO_buoy_old and UMBIO_buoy_2023to2025_unique
+UMBIO_buoy_allObservatons <- bind_rows(UMBIO_buoy_old, UMBIO_buoy_2023to2025_unique)
+
+UMBIO_buoy_allObservatons
+
+```
+```{r}
+data <- UMBIO_buoy_allObservatons %>% 
+  mutate(sea_water_temperature_0 = sea_surface_temperature) %>% 
+  mutate(sea_water_temperature_0_fixed_depth = as.numeric(0)) %>% #, sea_water_temperature_surface_fixed_depth = 0) %>% 
+  mutate(sea_water_temperature_0_fixed_depth = ifelse(!is.na(sea_water_temperature_0), 0, NA)) %>% 
+  select(time,sea_water_temperature_0,sea_water_temperature_0_fixed_depth,sea_water_temperature_1,sea_water_temperature_1_fixed_depth,sea_water_temperature_2,sea_water_temperature_2_fixed_depth,sea_water_temperature_3,sea_water_temperature_3_fixed_depth, sea_water_temperature_4,sea_water_temperature_4_fixed_depth, sea_water_temperature_5,sea_water_temperature_5_fixed_depth, sea_water_temperature_6,sea_water_temperature_6_fixed_depth, sea_water_temperature_7,sea_water_temperature_7_fixed_depth, sea_water_temperature_8,sea_water_temperature_8_fixed_depth)
+
+data
+```
+
+```{r}
+# Pivot the temperature data to a long format with depth numbers as an identifier
+
+long_data <- data %>%
+  select(time, starts_with("sea_water_temperature_"), -ends_with("fixed_depth")) %>%
+  pivot_longer(
+    cols = -time,
+    names_to = "temp_id",
+    values_to = "temperature",
+    names_prefix = "sea_water_temperature_",
+    values_drop_na = TRUE
+  ) %>%
+  # We extract just the numeric part for the join operation later on
+  mutate(depth_id = as.numeric(str_replace(temp_id, "sea_water_temperature_", ""))) %>%
+  select(-temp_id)
+
+# Create the lookup table for depth values, ensuring the pivot_longer doesn't mix types
+depth_lookup <- data %>%
+  select(contains("_fixed_depth")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "depth_id",
+    values_to = "depth",
+    names_pattern = "sea_water_temperature_(\\d+)_fixed_depth"
+  ) %>%
+  mutate(
+    depth_id = as.numeric(str_extract(depth_id, "\\d+")),
+    depth = as.numeric(depth)  # Convert depth to numeric to avoid type mismatch
+  ) %>%
+  # Remove NA values and get unique depth_id to depth mapping
+  filter(!is.na(depth)) %>%
+  distinct(depth_id, .keep_all = TRUE)
+
+# Make sure 'depth_id' is also numeric in long_data
+long_data <- long_data %>%
+  mutate(depth_id = as.numeric(depth_id))
+
+# Join the mapped depths back to the long_data
+long_data <- long_data %>%
+  left_join(depth_lookup, by = "depth_id")
+
+# Output the structure to validate
+print(head(long_data))
+```
+```{r}
+# Assuming 'long_data' is your dataframe
+
+# Ensure that 'long_data' is a single dataframe, not a list
+
+if (is.list(long_data)) {
+  long_data_bind <- bind_rows(long_data)
+}
+# with time, temperature, and depth_id after including sea_surface_temperature measurements
+
+long_data_timeFix <- long_data_bind %>%
+  mutate(time = as.POSIXct(time, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")) %>% 
+  mutate(hour = floor_date(time, "hour"))# make sure 'time' is POSIXct
+
+str(long_data_timeFix)
+```
+
+```{r}
+# Group by hour and depth_id, then calculate the mean temperature for each group
+average_temp_by_hour_and_depth <- long_data_timeFix %>%
+  group_by(hour, depth_id,depth) %>%
+  summarize(average_temperature = mean(temperature, na.rm = TRUE), .groups = "drop")
+
+# Convert temperatures from Kelvin to Celsius
+average_temp_by_hour_and_depth_celsius <- average_temp_by_hour_and_depth %>%
+  mutate(average_temperature_celsius = average_temperature - 273.15) %>% 
+  rename(date_hour = hour,depth_meters = depth, avg_temp_K = average_temperature, avg_temp_C = average_temperature_celsius)
+
+average_temp_by_hour_and_depth_celsius
+
+write_csv(average_temp_by_hour_and_depth_celsius,"~/Desktop/UMBIO_Buoy_Data/cleaned_data/UMBS_buoy_allYears_tempProfile.csv")
+
+```
+
+```{r}
+#now we're going to work up above water met data and the hydrolab data
+
+buoy_met_data <- UMBIO_buoy_allObservatons %>% 
+  select(time,air_temperature,air_pressure,dew_point_temperature,relative_humidity,surface_downwelling_shortwave_flux_in_air,wind_speed,wind_from_direction,wind_speed_of_gust) %>% 
+  filter(rowSums(is.na(cur_data())) < ncol(cur_data())) #
+  
+  
+buoy_met_data_hourly <- buoy_met_data %>% 
+  mutate(hour = floor_date(time, "hour")) %>% # make sure 'time' is POSIXct
+  group_by(hour) %>% 
+  summarise(avg_air_temp_k = mean(air_temperature,na.rm = TRUE),                                           avg_air_pressure = mean(air_pressure, na.rm = TRUE),
+    avg_dew_point_temp = mean(dew_point_temperature, na.rm = TRUE),
+    avg_relative_humidity = mean(relative_humidity, na.rm = TRUE),
+    avg_surface_downwelling_shortwave = mean(surface_downwelling_shortwave_flux_in_air, na.rm = TRUE),
+    avg_wind_speed = mean(wind_speed, na.rm = TRUE),
+    avg_wind_from_direction = mean(wind_from_direction, na.rm = TRUE),
+    avg_wind_speed_of_gust = mean(wind_speed_of_gust, na.rm = TRUE),
+    .groups = "drop") 
+  
+  
+buoy_met_data_hourly
+
+write_csv(buoy_met_data_hourly,"~/Desktop/UMBIO_Buoy_Data/cleaned_data/UMBio_allYears_buoy_met_data_hourly.csv")
+```
+
+```{r}
+buoy_hydrolab_data <- UMBIO_buoy_allObservatons %>% 
+  select(time,chlorophyll_fluorescence,fluorescent_dissolved_organic_matter,fractional_saturation_of_oxygen_in_sea_water,mass_concentration_of_oxygen_in_sea_water,phycocyanin_fluorescence,sea_water_electrical_conductivity,sea_water_ph_reported_on_total_scale) %>% 
+  filter(rowSums(is.na(cur_data())) < ncol(cur_data())) #
+
+buoy_hydrolab_data_hourly <- buoy_hydrolab_data %>% 
+   mutate(hour = floor_date(time, "hour")) %>% # make sure 'time' is POSIXct
+  group_by(hour) %>%
+  summarise(avg_chlorophyll_fluorescence = mean(chlorophyll_fluorescence,na.rm = TRUE),
+            avg_fluorescent_dissolved_organic_matter = mean(fluorescent_dissolved_organic_matter,na.rm = TRUE),
+            avg_fractional_saturation_of_oxygen_in_sea_water = mean(fractional_saturation_of_oxygen_in_sea_water,na.rm = TRUE),
+            avg_mass_concentration_of_oxygen_in_sea_water = mean(mass_concentration_of_oxygen_in_sea_water,na.rm = TRUE),
+            avg_phycocyanin_fluorescence = mean(phycocyanin_fluorescence,na.rm = TRUE),
+            avg_sea_water_electrical_conductivity = mean(sea_water_electrical_conductivity,na.rm = TRUE),
+            avg_sea_water_ph_reported_on_total_scale = mean(sea_water_ph_reported_on_total_scale,na.rm = TRUE))
+
+
+buoy_hydrolab_data
+buoy_hydrolab_data_hourly
+
+write_csv(buoy_hydrolab_data_hourly,"~/Desktop/UMBIO_Buoy_Data/cleaned_data/UMBio_allYears_buoy_hydroLab_data_hourly.csv")
+
+```
+
+```{r}
+install.packages("scales")
+install.packages("gridExtra")
+install.packages("grid")
+```
+
+```{r}
+#subset data by year
+library(gridExtra)
+library(grid)
+library(scales)
+library(ggplot2)
+
+ggplot(thermistor_subset,aes(time,Thermistor_String_at_4m)) + 
+  geom_point() + 
+  ggtitle("Daily Air Temperature\n NEON Harvard Forest\n 2009-2011") +
+  xlab("Date") + 
+  ylab("Temperature (C)") +
+  scale_x_date(labels=date_format ("%m-%y")) +
+  theme(plot.title = element_text(lineheight=.8, face="bold",size = 20)) +
+  theme(text = element_text(size=18))
+```
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
